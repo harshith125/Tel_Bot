@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import mammoth from "mammoth";
-import pdf from "pdf-parse";
+import pdf from "pdf-parse-new";
 
 const SUPPORTED_EXTENSIONS = [".pdf", ".docx"];
 const MAX_FILE_SIZE = 15 * 1024 * 1024;
