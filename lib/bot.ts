@@ -17,12 +17,15 @@ interface SessionData {
 
 export type MyContext = Context & SessionFlavor<SessionData>;
 
-const token = process.env.TELEGRAM_BOT_TOKEN;
-if (!token) {
-  console.warn("TELEGRAM_BOT_TOKEN is missing. Bot will not start.");
+function getBotToken(): string {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    throw new Error("TELEGRAM_BOT_TOKEN is missing in environment variables.");
+  }
+  return token;
 }
 
-export const bot = new Bot<MyContext>(token || "dummy");
+export const bot = new Bot<MyContext>(process.env.TELEGRAM_BOT_TOKEN || "dummy_token_for_build");
 
 bot.use(
   session({
@@ -36,20 +39,36 @@ bot.use(
 );
 
 async function downloadTelegramFile(fileId: string): Promise<Buffer> {
+  const token = getBotToken();
   const url = `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`;
-  const res = await fetch(url);
-  const data = await res.json();
   
-  if (!data.ok) {
-    throw new Error(`Failed to get file info: ${data.description}`);
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch {
+    throw new Error("Failed to reach Telegram API for file information.");
   }
   
-  const filePath = data.result.file_path;
-  const downloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+  const data = await res.json().catch(() => null);
+  if (!data || !data.ok) {
+    throw new Error(`Failed to get file info: ${data?.description || "Unknown Telegram API error"}`);
+  }
   
-  const fileRes = await fetch(downloadUrl);
+  const filePath = data.result?.file_path;
+  if (!filePath) {
+    throw new Error("No file path returned by Telegram.");
+  }
+  
+  const downloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+  let fileRes: Response;
+  try {
+    fileRes = await fetch(downloadUrl);
+  } catch {
+    throw new Error("Failed to download file content from Telegram.");
+  }
+  
   if (!fileRes.ok) {
-    throw new Error(`Failed to download file: ${fileRes.statusText}`);
+    throw new Error(`Failed to download file from Telegram (Status ${fileRes.status})`);
   }
   
   const arrayBuffer = await fileRes.arrayBuffer();

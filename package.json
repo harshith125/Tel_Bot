@@ -7,7 +7,9 @@
     "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint",
-    "bot": "tsx bot-dev.ts"
+    "bot": "tsx bot-dev.ts",
+    "set-webhook": "tsx scripts/set-webhook.ts",
+    "get-webhook-info": "tsx scripts/get-webhook-info.ts"
   },
   "dependencies": {
     "@google/genai": "^2.13.0",

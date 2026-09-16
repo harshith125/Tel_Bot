@@ -1,17 +1,19 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import type { ResumeAnalysis } from "@/types/analysis";
 
-const apiKey = process.env.GEMINI_API_KEY;
+let _aiClient: GoogleGenAI | null = null;
 
-if (!apiKey) {
-  throw new Error(
-    "GEMINI_API_KEY is missing from .env.local.",
-  );
+function getAiClient(): GoogleGenAI {
+  if (_aiClient) return _aiClient;
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "GEMINI_API_KEY is missing from environment variables.",
+    );
+  }
+  _aiClient = new GoogleGenAI({ apiKey });
+  return _aiClient;
 }
-
-const ai = new GoogleGenAI({
-  apiKey,
-});
 
 const MODEL_CANDIDATES = [
   process.env.GEMINI_MODEL,
@@ -301,7 +303,7 @@ ${resumeText.slice(0, 35_000)}
 
   for (const model of MODEL_CANDIDATES) {
     try {
-      const response = await ai.models.generateContent({
+      const response = await getAiClient().models.generateContent({
         model,
         contents: prompt,
         config: {
@@ -384,7 +386,7 @@ ${question}
 
   for (const model of MODEL_CANDIDATES) {
     try {
-      const response = await ai.models.generateContent({
+      const response = await getAiClient().models.generateContent({
         model,
         contents: prompt,
         config: {
