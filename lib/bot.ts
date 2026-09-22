@@ -102,7 +102,7 @@ async function downloadTelegramFile(fileId: string): Promise<Buffer> {
 // 1. COMMANDS
 // ---------------------------------------------------------------------------
 
-bot.command("start", async (ctx) => {
+bot.command(["start", "help"], async (ctx) => {
   await ctx.reply(
     "👋 <b>Welcome to HireMatrix AI!</b>\n\n" +
       "I analyze job descriptions (JDs) and candidate resumes (CVs) with automated scoring, ranking, and intelligent Q&A.\n\n" +
@@ -123,17 +123,17 @@ bot.command("start", async (ctx) => {
   );
 });
 
-bot.command("addjd", async (ctx) => {
+bot.command(["addjd", "jd"], async (ctx) => {
   ctx.session.uploadMode = "jd";
   await ctx.reply("📁 Mode set to <b>Job Descriptions</b>. Next documents or Drive links will be treated as JDs.", { parse_mode: "HTML" });
 });
 
-bot.command("addresume", async (ctx) => {
+bot.command(["addresume", "resume", "cv"], async (ctx) => {
   ctx.session.uploadMode = "resume";
   await ctx.reply("📄 Mode set to <b>Resumes</b>. Next documents or Drive links will be treated as Resumes.", { parse_mode: "HTML" });
 });
 
-bot.command("reset", async (ctx) => {
+bot.command(["reset", "rest", "clear"], async (ctx) => {
   const userId = String(ctx.from?.id || "");
   ctx.session.jobDescriptions = [];
   ctx.session.resumes = [];
@@ -142,10 +142,12 @@ bot.command("reset", async (ctx) => {
   if (userId) {
     clearUserData(userId);
   }
-  await ctx.reply("🔄 Session reset. All uploaded documents and Drive connections cleared.");
+  await ctx.reply("🔄 <b>Session reset.</b> All uploaded documents and Drive connections have been cleared.", {
+    parse_mode: "HTML",
+  });
 });
 
-bot.command("folders", async (ctx) => {
+bot.command(["folders", "folder"], async (ctx) => {
   const userId = String(ctx.from?.id || "");
   const connections = getUserFolderConnections(userId);
 
@@ -217,7 +219,7 @@ bot.command("status", async (ctx) => {
   );
 });
 
-bot.command("analyze", async (ctx) => {
+bot.command(["analyze", "analyse"], async (ctx) => {
   const userId = String(ctx.from?.id || "");
 
   // Merge session with persistent DB documents

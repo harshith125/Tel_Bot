@@ -416,6 +416,12 @@ export function clearUserData(telegramUserId: string): void {
     }
   }
 
+  for (const [id, conn] of Object.entries(db.folderConnections)) {
+    if (conn.telegramUserId === userId) {
+      delete db.folderConnections[id];
+    }
+  }
+
   delete db.userAnalysisResults[userId];
   flushDb();
 
