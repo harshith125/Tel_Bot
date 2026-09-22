@@ -1,5 +1,10 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import type { ResumeAnalysis } from "@/types/analysis";
+import {
+  extractCandidateId,
+  formatCandidateDisplayName,
+  isReliableCandidateName,
+} from "./candidate-utils";
 
 let _aiClient: GoogleGenAI | null = null;
 
@@ -15,15 +20,22 @@ function getAiClient(): GoogleGenAI {
   return _aiClient;
 }
 
-const MODEL_CANDIDATES = [
-  process.env.GEMINI_MODEL,
-  "gemini-3.1-flash-lite",
-  "gemini-3.5-flash",
-  "gemini-2.5-flash-lite-latest",
-  "gemini-2.0-flash",
-].filter(
-  (model): model is string =>
-    typeof model === "string" && model.length > 0,
+const MODEL_CANDIDATES = Array.from(
+  new Set(
+    [
+      process.env.GEMINI_MODEL,
+      "gemini-3.1-flash-lite",
+      "gemini-3-flash-preview",
+      "gemini-flash-lite-latest",
+      "gemini-3.5-flash-lite",
+      "gemini-3.6-flash",
+      "gemini-3.7-flash",
+      "gemini-3.5-flash",
+    ].filter(
+      (model): model is string =>
+        typeof model === "string" && model.length > 0,
+    )
+  )
 );
 
 const responseSchema = {
@@ -31,13 +43,16 @@ const responseSchema = {
   properties: {
     candidateName: {
       type: Type.STRING,
+      description:
+        "The candidate's real full name ONLY if explicitly and reliably present in the CV. If anonymous or no reliable name is found, return an empty string. NEVER return 'Anonymous', 'Unknown', 'N/A', or infer/guess a name.",
     },
     resumeFilename: {
       type: Type.STRING,
     },
     evaluationReasoning: {
       type: Type.STRING,
-      description: "Detailed step-by-step reasoning evaluating the candidate against the JD before giving a score.",
+      description:
+        "Detailed step-by-step reasoning evaluating the candidate against the JD before giving a score.",
     },
     overallScore: {
       type: Type.INTEGER,
@@ -186,9 +201,17 @@ function clampScore(value: unknown): number {
 function normalizeResult(
   result: ResumeAnalysis,
   filename: string,
+  candidateId: string,
 ): ResumeAnalysis {
+  const rawName = result.candidateName?.trim() || "";
+  const reliableName = isReliableCandidateName(rawName) ? rawName : "";
+  const displayName = formatCandidateDisplayName(candidateId, reliableName);
+
   return {
     ...result,
+    candidateId,
+    candidateName: reliableName,
+    displayName,
     resumeFilename: filename,
     overallScore: clampScore(result.overallScore),
 
@@ -233,18 +256,41 @@ function normalizeResult(
   };
 }
 
-function isModelUnavailable(error: unknown): boolean {
+function shouldFailover(error: unknown): boolean {
+  if (!error) return false;
   const message =
     error instanceof Error
       ? error.message.toLowerCase()
       : String(error).toLowerCase();
 
+  const status =
+    (error as any)?.status ||
+    (error as any)?.code ||
+    (error as any)?.error?.code;
+
   return (
+    status === 404 ||
+    status === 429 ||
+    status === 500 ||
+    status === 503 ||
+    status === 504 ||
     message.includes("404") ||
+    message.includes("429") ||
+    message.includes("500") ||
+    message.includes("503") ||
+    message.includes("504") ||
     message.includes("not_found") ||
     message.includes("not found") ||
     message.includes("no longer available") ||
-    message.includes("unsupported model")
+    message.includes("unsupported model") ||
+    message.includes("high demand") ||
+    message.includes("resource_exhausted") ||
+    message.includes("quota") ||
+    message.includes("rate limit") ||
+    message.includes("unavailable") ||
+    message.includes("overloaded") ||
+    message.includes("temporarily unavailable") ||
+    message.includes("try again later")
   );
 }
 
@@ -252,17 +298,26 @@ export async function analyzeResume(
   jobDescription: string,
   resumeFilename: string,
   resumeText: string,
+  candidateId?: string,
 ): Promise<{
   result: ResumeAnalysis;
   modelUsed: string;
 }> {
+  const effectiveCandidateId =
+    candidateId || extractCandidateId(resumeFilename);
+
   const prompt = `
 You are an experienced ATS evaluator and technical recruiter.
 
 Compare the candidate's resume with the job description.
 
-STRICT RULES:
+CANDIDATE IDENTIFICATION RULES:
+1. Extract candidate's real name from the resume ONLY when the name is explicitly and reliably present.
+2. If no reliable name is detected (e.g. anonymous CV or name not provided), return an empty string "" for candidateName. DO NOT use "Anonymous", "Unknown", "N/A", "Candidate", or similar placeholders as candidateName.
+3. NEVER hallucinate, infer, or guess a person's name from incomplete information.
+4. Candidate ID is: ${effectiveCandidateId}. Preserve this identifier.
 
+STRICT EVALUATION RULES:
 1. Use only information present in the resume.
 2. Never invent experience, education, projects, results,
    certifications or technical skills.
@@ -281,7 +336,6 @@ STRICT RULES:
 10. Return only the structured JSON result. YOU MUST write out your \`evaluationReasoning\` BEFORE outputting the \`overallScore\`.
 
 SCORING GUIDANCE:
-
 - Skills: alignment of required and preferred skills
 - Experience: relevance and depth of work/internships
 - Education: alignment with educational requirements
@@ -291,6 +345,9 @@ SCORING GUIDANCE:
 
 JOB DESCRIPTION:
 ${jobDescription.slice(0, 35_000)}
+
+CANDIDATE ID:
+${effectiveCandidateId}
 
 RESUME FILENAME:
 ${resumeFilename}
@@ -324,7 +381,11 @@ ${resumeText.slice(0, 35_000)}
       ) as ResumeAnalysis;
 
       return {
-        result: normalizeResult(parsed, resumeFilename),
+        result: normalizeResult(
+          parsed,
+          resumeFilename,
+          effectiveCandidateId,
+        ),
         modelUsed: model,
       };
     } catch (error) {
@@ -335,7 +396,7 @@ ${resumeText.slice(0, 35_000)}
         error,
       );
 
-      if (!isModelUnavailable(error)) {
+      if (!shouldFailover(error)) {
         throw error;
       }
     }
@@ -355,11 +416,38 @@ export async function askQuestion(
   question: string,
   jobDescription: string,
   analysisResults: ResumeAnalysis[],
-  resumes: { filename: string; text: string }[]
+  resumes: { filename: string; text: string; candidateId?: string }[]
 ): Promise<string> {
-  const rawResumesText = resumes.map(r => `--- RESUME: ${r.filename} ---\n${r.text}`).join("\n\n");
+  const rawResumesText = resumes
+    .map((r, index) => {
+      const id = r.candidateId || extractCandidateId(r.filename, index);
+      return `--- CANDIDATE ID: ${id} | FILENAME: ${r.filename} ---\n${r.text}`;
+    })
+    .join("\n\n");
+
+  const candidatesSummary = analysisResults.map((res) => ({
+    candidateId: res.candidateId,
+    candidateName: res.candidateName || undefined,
+    displayName: res.displayName,
+    resumeFilename: res.resumeFilename,
+    overallScore: res.overallScore,
+    recommendation: res.recommendation,
+    scoreBreakdown: res.scoreBreakdown,
+    matchedSkills: res.matchedSkills,
+    missingSkills: res.missingSkills,
+    strengths: res.strengths,
+    improvements: res.improvements,
+    summary: res.summary,
+    evaluationReasoning: res.evaluationReasoning,
+  }));
+
   const prompt = `
 You are an expert technical recruiter and ATS specialist answering a hiring manager's questions.
+
+CRITICAL CANDIDATE IDENTIFICATION & RESOLUTION:
+1. Each candidate is uniquely identified by their Candidate ID (e.g. CV273, CV390) and Display Name (e.g. "CV273" or "John Doe (CV273)").
+2. When the hiring manager asks questions referencing a Candidate ID (e.g., "Tell me more about CV273", "Why did CV390 get a low score?", "Compare CV273 and CV390"), accurately resolve that candidate using their Candidate ID.
+3. In your response, refer to candidates using their Display Name (e.g. "CV273" or "John Doe (CV273)").
 
 CRITICAL FORMATTING RULES:
 1. DO NOT use Markdown tables (they are not supported by the platform).
@@ -368,14 +456,14 @@ CRITICAL FORMATTING RULES:
 4. For rankings or summaries, use clean bullet points or numbered lists instead of tables.
 5. Structure your response clearly with bold headings and separate sections with spacing.
 
-Below you will find the RAW RESUME TEXT of the candidates, followed by the AI-generated CANDIDATES ANALYSIS, and the JOB DESCRIPTION.
+Below you will find the RAW RESUME TEXT of the candidates (labeled with CANDIDATE ID and FILENAME), followed by the AI-generated CANDIDATES ANALYSIS, and the JOB DESCRIPTION.
 You MUST search the RAW RESUME TEXT to answer specific questions (like CGPA, phone numbers, exact dates, etc.) that might not be in the summary.
 
 RAW CANDIDATES RESUME TEXT:
 ${rawResumesText.slice(0, 40000)}
 
-CANDIDATES ANALYSIS (Summaries and Scores):
-${JSON.stringify(analysisResults, null, 2).slice(0, 20000)}
+CANDIDATES ANALYSIS (Summaries, IDs, and Scores):
+${JSON.stringify(candidatesSummary, null, 2).slice(0, 20000)}
 
 JOB DESCRIPTION:
 ${jobDescription.slice(0, 15000)}
@@ -383,6 +471,8 @@ ${jobDescription.slice(0, 15000)}
 HIRING MANAGER'S QUESTION:
 ${question}
   `;
+
+  let lastError: unknown;
 
   for (const model of MODEL_CANDIDATES) {
     try {
@@ -400,11 +490,20 @@ ${question}
 
       return response.text;
     } catch (error) {
-      if (!isModelUnavailable(error)) {
+      lastError = error;
+      console.error(`Gemini model ${model} failed in Q&A:`, error);
+      if (!shouldFailover(error)) {
         throw error;
       }
     }
   }
 
-  throw new Error("None of the configured Gemini models are available for Q&A.");
+  throw new Error(
+    "None of the configured Gemini models are available for Q&A. " +
+      `Last error: ${
+        lastError instanceof Error
+          ? lastError.message
+          : String(lastError)
+      }`,
+  );
 }

@@ -2,6 +2,8 @@ import JSZip from "jszip";
 import mammoth from "mammoth";
 import pdf from "pdf-parse-new";
 
+import { extractCandidateId } from "./candidate-utils";
+
 const SUPPORTED_EXTENSIONS = [".pdf", ".docx"];
 const MAX_FILE_SIZE = 15 * 1024 * 1024;
 const MAX_TEXT_LENGTH = 40_000;
@@ -10,6 +12,7 @@ const MAX_ZIP_FILES = 30;
 export interface ParsedDocument {
   filename: string;
   text: string;
+  candidateId?: string;
 }
 
 function getExtension(filename: string): string {
@@ -69,6 +72,7 @@ export async function extractDocumentText(
 export async function parseUploadedFile(
   filename: string,
   buffer: Buffer,
+  fallbackIndex?: number,
 ): Promise<ParsedDocument> {
   const text = await extractDocumentText(filename, buffer);
 
@@ -82,6 +86,7 @@ export async function parseUploadedFile(
   return {
     filename,
     text,
+    candidateId: extractCandidateId(filename, fallbackIndex),
   };
 }
 
@@ -113,23 +118,31 @@ export async function extractResumesFromZip(
     );
   }
 
-  const parsedPromises = entries.map(async (entry) => {
-    try {
-      const entryBuffer = await entry.async("nodebuffer");
-      const filename = entry.name.split("/").pop() ?? entry.name;
-      const text = await extractDocumentText(filename, entryBuffer);
+  const parsedPromises: Promise<ParsedDocument | null>[] = entries.map(
+    async (entry, index): Promise<ParsedDocument | null> => {
+      try {
+        const entryBuffer = await entry.async("nodebuffer");
+        const filename = entry.name.split("/").pop() ?? entry.name;
+        const text = await extractDocumentText(filename, entryBuffer);
 
-      if (text) {
-        return { filename, text };
+        if (text) {
+          return {
+            filename,
+            text,
+            candidateId: extractCandidateId(filename, index),
+          };
+        }
+      } catch (error) {
+        console.error(`Unable to parse ZIP entry ${entry.name}:`, error);
       }
-    } catch (error) {
-      console.error(`Unable to parse ZIP entry ${entry.name}:`, error);
+      return null;
     }
-    return null;
-  });
+  );
 
   const resolvedDocuments = await Promise.all(parsedPromises);
-  const documents = resolvedDocuments.filter((doc): doc is ParsedDocument => doc !== null);
+  const documents: ParsedDocument[] = resolvedDocuments.filter(
+    (doc): doc is ParsedDocument => doc !== null
+  );
 
   if (documents.length === 0) {
     throw new Error(

@@ -10,21 +10,35 @@ const grammyHandler = webhookCallback(bot, "std/http", {
 });
 
 export async function POST(req: Request) {
-  const secretToken = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (secretToken) {
-    const headerSecret = req.headers.get("x-telegram-bot-api-secret-token");
-    if (!headerSecret || headerSecret !== secretToken) {
-      return new Response(
-        JSON.stringify({ error: "Unauthorized: Invalid secret token" }),
-        {
-          status: 401,
-          headers: { "Content-Type": "application/json" },
-        }
-      );
+  try {
+    const secretToken = process.env.TELEGRAM_WEBHOOK_SECRET;
+    if (secretToken) {
+      const headerSecret = req.headers.get("x-telegram-bot-api-secret-token");
+      if (!headerSecret || headerSecret !== secretToken) {
+        return new Response(
+          JSON.stringify({ error: "Unauthorized: Invalid secret token" }),
+          {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
     }
-  }
 
-  return grammyHandler(req);
+    return await grammyHandler(req);
+  } catch (err) {
+    console.error("Webhook POST handler error:", err);
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: err instanceof Error ? err.message : "Internal Server Error",
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
 }
 
 export async function GET() {

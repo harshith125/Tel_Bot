@@ -6,6 +6,7 @@ import {
   ParsedDocument,
 } from "./document-parser";
 import { analyzeResume, askQuestion } from "./gemini";
+import { ensureUniqueCandidateIds, extractCandidateId } from "./candidate-utils";
 import type { ResumeAnalysis } from "../types/analysis";
 
 interface SessionData {
@@ -136,8 +137,12 @@ bot.command("analyze", async (ctx) => {
     await ctx.reply("❌ Please upload at least one resume first.");
     return;
   }
+
+  // Ensure unique candidate IDs for all uploaded resumes
+  ctx.session.resumes = ensureUniqueCandidateIds(resumes);
+  const processedResumes = ctx.session.resumes;
   
-  const statusMsg = await ctx.reply(`🔍 Starting analysis of ${resumes.length} resume(s) against ${jobDescriptions.length} JD(s)... This might take a few minutes.`);
+  const statusMsg = await ctx.reply(`🔍 Starting analysis of ${processedResumes.length} resume(s) against ${jobDescriptions.length} JD(s)... This might take a few minutes.`);
   
   // Clear previous results
   ctx.session.analysisResults = [];
@@ -149,8 +154,8 @@ bot.command("analyze", async (ctx) => {
     const results: ResumeAnalysis[] = [];
     let modelUsed = "";
     
-    for (let i = 0; i < resumes.length; i++) {
-      const resume = resumes[i];
+    for (let i = 0; i < processedResumes.length; i++) {
+      const resume = processedResumes[i];
       
       let success = false;
       let retries = 3;
@@ -158,17 +163,22 @@ bot.command("analyze", async (ctx) => {
       while (!success && retries > 0) {
         try {
           if (i > 0 || j > 0) {
-            // Small 500ms delay to prevent socket flooding (instead of 4000ms!)
+            // Small 500ms delay to prevent socket flooding
             await new Promise(resolve => setTimeout(resolve, 500));
           }
           
           await ctx.api.editMessageText(
             ctx.chat.id, 
             statusMsg.message_id, 
-            `⏳ Analyzing JD ${j + 1}/${jobDescriptions.length} | Resume ${i + 1}/${resumes.length} (${resume.filename})... Please wait.`
+            `⏳ Analyzing JD ${j + 1}/${jobDescriptions.length} | Candidate ${i + 1}/${processedResumes.length} (${resume.candidateId || resume.filename})... Please wait.`
           ).catch(() => {}); // Ignore duplicate text edit errors
           
-          const analysis = await analyzeResume(jd.text, resume.filename, resume.text);
+          const analysis = await analyzeResume(
+            jd.text,
+            resume.filename,
+            resume.text,
+            resume.candidateId
+          );
           results.push(analysis.result);
           modelUsed = analysis.modelUsed;
           success = true;
@@ -200,7 +210,7 @@ bot.command("analyze", async (ctx) => {
       
       let summaryText = `📊 <b>Candidate Ranking</b> (Model: ${modelUsed})\n<b>Role:</b> ${jd.filename}\n\n`;
       results.forEach((res, index) => {
-        summaryText += `${index + 1}. <b>${res.candidateName || res.resumeFilename}</b> - Score: ${res.overallScore}/100\n`;
+        summaryText += `${index + 1}. <b>${res.displayName}</b> — Score: ${res.overallScore}/100\n`;
       });
       
       await ctx.reply(summaryText, { parse_mode: "HTML" });
@@ -210,7 +220,8 @@ bot.command("analyze", async (ctx) => {
         const expSuggestions = res.suggestedResume?.experienceSuggestions?.map(s => `• ${s}`).join("\n") || "No specific experience suggestions.";
         
         const details = 
-          `👤 <b>${res.candidateName || res.resumeFilename}</b> (${res.overallScore}/100 - ${res.recommendation})\n` +
+          `👤 <b>Candidate:</b> ${res.displayName}\n` +
+          `<b>Score:</b> ${res.overallScore}/100 — ${res.recommendation}\n` +
           `<i>Role: ${jd.filename}</i>\n\n` +
           `<b>Evaluator's Reasoning:</b>\n${res.evaluationReasoning || "No reasoning provided."}\n\n` +
           `<b>Missing from JD:</b>\n${missing}\n\n` +
@@ -255,7 +266,11 @@ bot.on("message:document", async (ctx) => {
     }
     
     if (ext === ".pdf" || ext === ".docx") {
-      const parsed = await parseUploadedFile(filename, buffer);
+      const parsed = await parseUploadedFile(
+        filename,
+        buffer,
+        isJdMode ? undefined : ctx.session.resumes.length
+      );
       if (isJdMode) {
         ctx.session.jobDescriptions.push(parsed);
         await ctx.api.editMessageText(
@@ -269,7 +284,7 @@ bot.on("message:document", async (ctx) => {
         await ctx.api.editMessageText(
           ctx.chat.id, 
           loadingMessage.message_id, 
-          `✅ Resume added: ${filename}\nTotal resumes: ${ctx.session.resumes.length}. Send more or type /analyze.`
+          `✅ Resume added: ${filename} (Candidate ID: ${parsed.candidateId || "Auto"})\nTotal resumes: ${ctx.session.resumes.length}. Send more or type /analyze.`
         );
       }
     } else if (ext === ".zip") {
@@ -312,8 +327,9 @@ bot.on("message:text", async (ctx) => {
   // If analysis is done and it's a short message, treat as a question
   if (ctx.session.analysisResults && ctx.session.analysisResults.length > 0) {
     // Treat as Q&A
+    let waitMsg: any;
     try {
-      const waitMsg = await ctx.reply("🤔 Thinking...");
+      waitMsg = await ctx.reply("🤔 Thinking...");
       const allJDs = ctx.session.jobDescriptions.map(jd => `--- JD: ${jd.filename} ---\n${jd.text}`).join("\n\n");
       const answer = await askQuestion(
         text, 
@@ -321,10 +337,26 @@ bot.on("message:text", async (ctx) => {
         ctx.session.analysisResults,
         ctx.session.resumes
       );
-      await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id, answer, { parse_mode: "HTML" });
+      
+      try {
+        await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id, answer, { parse_mode: "HTML" });
+      } catch {
+        // Fallback without HTML parse mode if Telegram entity parsing fails
+        await ctx.api.editMessageText(ctx.chat.id, waitMsg.message_id, answer).catch(async () => {
+          await ctx.reply(answer);
+        });
+      }
     } catch (error) {
-      console.error(error);
-      await ctx.reply("❌ Sorry, I encountered an error while answering that.");
+      console.error("Q&A Error:", error);
+      if (waitMsg?.message_id) {
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          waitMsg.message_id,
+          "❌ Sorry, I encountered an error while answering that. Please try asking again."
+        ).catch(() => {});
+      } else {
+        await ctx.reply("❌ Sorry, I encountered an error while answering that. Please try asking again.");
+      }
     }
     return;
   }
@@ -350,8 +382,13 @@ bot.on("message:text", async (ctx) => {
     ctx.session.jobDescriptions.push({ filename: "Pasted Text", text });
     await ctx.reply(`✅ Job Description added from text.\nTotal JDs: ${ctx.session.jobDescriptions.length}. Type /addresume to upload resumes, or /analyze.`);
   } else {
-    ctx.session.resumes.push({ filename: "Pasted Text", text });
+    const candidateId = `CV${ctx.session.resumes.length + 1}`;
+    ctx.session.resumes.push({
+      filename: `Pasted Text (${candidateId})`,
+      text,
+      candidateId,
+    });
     ctx.session.analysisResults = null;
-    await ctx.reply(`✅ Resume added from text.\nTotal resumes: ${ctx.session.resumes.length}. Send more or type /analyze.`);
+    await ctx.reply(`✅ Resume added from text (${candidateId}).\nTotal resumes: ${ctx.session.resumes.length}. Send more or type /analyze.`);
   }
 });

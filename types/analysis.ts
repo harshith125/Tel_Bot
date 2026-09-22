@@ -17,7 +17,9 @@ export interface SuggestedResume {
 }
 
 export interface ResumeAnalysis {
+  candidateId: string;
   candidateName: string;
+  displayName: string;
   resumeFilename: string;
   evaluationReasoning: string;
   overallScore: number;
