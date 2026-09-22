@@ -10,6 +10,7 @@ import { analyzeResume, askQuestion } from "./gemini";
 import { ensureUniqueCandidateIds, extractCandidateId } from "./candidate-utils";
 import {
   parseDriveUrl,
+  extractAllDriveUrls,
   downloadDriveFile,
   getDriveFileMetadata,
   listFilesInFolder,
@@ -454,75 +455,27 @@ bot.on("message:text", async (ctx) => {
   // -------------------------------------------------------------------------
   // A. GOOGLE DRIVE LINK DETECTION (File or Folder)
   // -------------------------------------------------------------------------
-  const driveUrl = parseDriveUrl(text);
-  if (driveUrl) {
-    if (driveUrl.type === "file") {
-      const waitMsg = await ctx.reply("🔍 <b>Google Drive file detected.</b> Verifying access and downloading...", {
-        parse_mode: "HTML",
-      });
+  const driveUrls = extractAllDriveUrls(text);
+  if (driveUrls.length > 0) {
+    const folders = driveUrls.filter((d) => d.type === "folder");
+    const files = driveUrls.filter((d) => d.type === "file");
 
-      try {
-        const meta = await getDriveFileMetadata(driveUrl.id);
-        const buffer = await downloadDriveFile(driveUrl.id);
-        const parsedText = await extractDocumentText(meta.name, buffer);
-
-        const docType = classifyDocumentType(meta.name, ctx.session.uploadMode);
-        const candidateId = docType === "RESUME" ? extractCandidateId(meta.name) : undefined;
-
-        const doc: ParsedDocument = {
-          filename: meta.name,
-          text: parsedText,
-          candidateId,
-        };
-
-        if (docType === "JD") {
-          ctx.session.jobDescriptions.push(doc);
-          if (userId) saveUserManualDocument(userId, doc, "JD");
-          await ctx.api.editMessageText(
-            ctx.chat.id,
-            waitMsg.message_id,
-            `✅ <b>Job Description added from Google Drive:</b> ${meta.name}\nTotal JDs: ${ctx.session.jobDescriptions.length}. Send resumes or type /analyze.`,
-            { parse_mode: "HTML" }
-          );
-        } else {
-          ctx.session.resumes.push(doc);
-          ctx.session.analysisResults = null;
-          if (userId) saveUserManualDocument(userId, doc, "RESUME");
-          await ctx.api.editMessageText(
-            ctx.chat.id,
-            waitMsg.message_id,
-            `✅ <b>Resume added from Google Drive:</b> ${meta.name} (Candidate ID: ${candidateId || "Auto"})\nTotal resumes: ${ctx.session.resumes.length}. Send more or type /analyze.`,
-            { parse_mode: "HTML" }
-          );
-        }
-      } catch (err) {
-        console.error("Failed to process Google Drive file link:", err);
-        const msg = err instanceof Error ? err.message : String(err);
-        await ctx.api.editMessageText(
-          ctx.chat.id,
-          waitMsg.message_id,
-          `❌ <b>Failed to process Google Drive file:</b> ${msg}\n\n<i>Tip: Ensure the file is shared with the Bot's Service Account email or link sharing is set to 'Anyone with the link'.</i>`,
-          { parse_mode: "HTML" }
-        );
-      }
-      return;
-    }
-
-    if (driveUrl.type === "folder") {
+    // 1. Process Folders
+    for (const folder of folders) {
       const waitMsg = await ctx.reply("📁 <b>Google Drive folder detected.</b> Connecting and scanning files...", {
         parse_mode: "HTML",
       });
 
       try {
-        const files = await listFilesInFolder(driveUrl.id);
-        const jds = files.filter((f) => classifyDocumentType(f.name, ctx.session.uploadMode) === "JD");
-        const resumes = files.filter((f) => classifyDocumentType(f.name, ctx.session.uploadMode) === "RESUME");
+        const folderFiles = await listFilesInFolder(folder.id);
+        const jds = folderFiles.filter((f) => classifyDocumentType(f.name, ctx.session.uploadMode) === "JD");
+        const resumes = folderFiles.filter((f) => classifyDocumentType(f.name, ctx.session.uploadMode) === "RESUME");
 
         const conn: DriveFolderConnection = {
-          id: `${userId}_${driveUrl.id}`,
+          id: `${userId}_${folder.id}`,
           telegramUserId: userId,
           chatId: String(ctx.chat.id),
-          folderId: driveUrl.id,
+          folderId: folder.id,
           connectedAt: new Date().toISOString(),
           uploadMode: ctx.session.uploadMode,
         };
@@ -534,8 +487,8 @@ bot.on("message:text", async (ctx) => {
           waitMsg.message_id,
           `📁 <b>Google Drive folder connected.</b>\n\n` +
             `<b>Found:</b>\n` +
-            `JDs: ${jds.length}\n` +
-            `Resumes: ${resumes.length}\n\n` +
+            `• JDs: ${jds.length}\n` +
+            `• Resumes: ${resumes.length}\n\n` +
             `⏳ Starting analysis...`,
           { parse_mode: "HTML" }
         );
@@ -576,12 +529,83 @@ bot.on("message:text", async (ctx) => {
         await ctx.api.editMessageText(
           ctx.chat.id,
           waitMsg.message_id,
-          `❌ <b>Failed to connect Google Drive folder:</b> ${msg}\n\n<i>Tip: Share the folder with the Bot's Service Account email with Viewer access.</i>`,
+          `❌ <b>Failed to connect Google Drive folder:</b>\n${msg}`,
           { parse_mode: "HTML" }
         );
       }
-      return;
     }
+
+    // 2. Process Files
+    if (files.length > 0) {
+      const waitMsg = await ctx.reply(
+        files.length === 1
+          ? "🔍 <b>Google Drive link detected.</b> Downloading and processing..."
+          : `🔍 <b>${files.length} Google Drive links detected.</b> Downloading and processing...`,
+        { parse_mode: "HTML" }
+      );
+
+      let processedCount = 0;
+      let errorCount = 0;
+
+      for (const file of files) {
+        try {
+          const meta = await getDriveFileMetadata(file.id);
+          const buffer = await downloadDriveFile(file.id);
+          const parsedText = await extractDocumentText(meta.name, buffer);
+
+          const docType = classifyDocumentType(meta.name, ctx.session.uploadMode);
+          const candidateId = docType === "RESUME" ? extractCandidateId(meta.name) : undefined;
+
+          const doc: ParsedDocument = {
+            filename: meta.name,
+            text: parsedText,
+            candidateId,
+          };
+
+          if (docType === "JD") {
+            ctx.session.jobDescriptions.push(doc);
+            if (userId) saveUserManualDocument(userId, doc, "JD");
+          } else {
+            ctx.session.resumes.push(doc);
+            ctx.session.analysisResults = null;
+            if (userId) saveUserManualDocument(userId, doc, "RESUME");
+          }
+          processedCount++;
+        } catch (err) {
+          console.error(`Failed to process Google Drive file ${file.id}:`, err);
+          errorCount++;
+        }
+      }
+
+      if (processedCount > 0) {
+        const jdCount = ctx.session.jobDescriptions.length;
+        const resCount = ctx.session.resumes.length;
+
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          waitMsg.message_id,
+          `✅ <b>Google Drive ${processedCount === 1 ? "file" : `${processedCount} files`} added successfully!</b>\n\n` +
+            `📁 <b>Current Queue:</b>\n` +
+            `• Job Descriptions: ${jdCount}\n` +
+            `• Resumes: ${resCount}\n\n` +
+            (jdCount > 0 && resCount > 0
+              ? `🚀 Type /analyze to evaluate candidates!`
+              : jdCount === 0
+              ? `💡 Send a Job Description (PDF/Word/Link) to compare candidates against.`
+              : `💡 Send resumes (PDF/Word/Links) to analyze.`),
+          { parse_mode: "HTML" }
+        );
+      } else {
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          waitMsg.message_id,
+          `❌ <b>Could not download Google Drive file(s).</b>\n\n<i>Please ensure the Google Drive file is shared with 'Anyone with the link' (Viewer access).</i>`,
+          { parse_mode: "HTML" }
+        );
+      }
+    }
+
+    return;
   }
 
   // -------------------------------------------------------------------------

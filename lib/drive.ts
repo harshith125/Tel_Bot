@@ -123,8 +123,11 @@ export async function downloadPublicDriveFile(
 ): Promise<{ buffer: Buffer; filename?: string }> {
   const downloadUrls = [
     `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`,
+    `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`,
     `https://docs.google.com/document/d/${fileId}/export?format=pdf`,
     `https://docs.google.com/document/d/${fileId}/export?format=docx`,
+    `https://docs.google.com/spreadsheets/d/${fileId}/export?format=pdf`,
+    `https://docs.google.com/presentation/d/${fileId}/export/pdf`,
   ];
 
   for (const url of downloadUrls) {
@@ -132,7 +135,8 @@ export async function downloadPublicDriveFile(
       const res = await fetch(url, {
         headers: {
           "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          "Accept-Language": "en-US,en;q=0.9",
         },
         redirect: "follow",
       });
@@ -140,9 +144,25 @@ export async function downloadPublicDriveFile(
       if (res.ok) {
         const contentType = res.headers.get("content-type") || "";
 
-        // If Google presents an HTML confirmation page for large files, parse confirm token
+        // If Google presents an HTML confirmation page for large files or virus warning, parse download href/token
         if (contentType.includes("text/html")) {
           const html = await res.text();
+          
+          // Pattern 1: usercontent direct link
+          const userContentMatch = html.match(/href="([^"]*drive\.usercontent\.google\.com\/download[^"]*)"/i);
+          if (userContentMatch) {
+            const directUrl = userContentMatch[1].replace(/&amp;/g, "&");
+            const directRes = await fetch(directUrl, { redirect: "follow" });
+            if (directRes.ok) {
+              const arrayBuf = await directRes.arrayBuffer();
+              const buf = Buffer.from(arrayBuf);
+              if (buf.length > 100) {
+                return { buffer: buf };
+              }
+            }
+          }
+
+          // Pattern 2: confirm token
           const confirmMatch = html.match(/confirm=([0-9A-Za-z_-]+)/);
           if (confirmMatch) {
             const confirmRes = await fetch(
@@ -178,7 +198,7 @@ export async function downloadPublicDriveFile(
   }
 
   throw new Error(
-    "Could not download file. Please ensure the Google Drive file is shared with 'Anyone with the link' (Viewer), or configure GOOGLE_SERVICE_ACCOUNT_KEY in environment variables."
+    "Could not download file. Please ensure the Google Drive file is shared with 'Anyone with the link' (Viewer access)."
   );
 }
 
@@ -274,43 +294,147 @@ export async function downloadDriveFile(fileId: string): Promise<Buffer> {
 export async function listFilesInFolder(folderId: string): Promise<DriveItemMetadata[]> {
   const drive = getDriveClient();
 
-  if (!drive) {
-    throw new Error(
-      "To connect and monitor Google Drive folders, a Google Cloud Service Account is required. Please set GOOGLE_SERVICE_ACCOUNT_KEY in your environment variables and share the folder with the Service Account email."
-    );
+  // 1. Try Google Drive API if credentials exist
+  if (drive) {
+    try {
+      const files: DriveItemMetadata[] = [];
+      let pageToken: string | undefined = undefined;
+
+      do {
+        const res: any = await drive.files.list({
+          q: `'${folderId}' in parents and trashed = false and (mimeType = 'application/pdf' or mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or name contains '.pdf' or name contains '.docx')`,
+          fields: "nextPageToken, files(id, name, mimeType, modifiedTime, size)",
+          pageSize: 100,
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          pageToken,
+        });
+
+        if (res.data.files) {
+          for (const f of res.data.files) {
+            if (f.id && f.name) {
+              files.push({
+                id: f.id,
+                name: f.name,
+                mimeType: f.mimeType || "application/octet-stream",
+                modifiedTime: f.modifiedTime || new Date().toISOString(),
+                size: f.size || undefined,
+              });
+            }
+          }
+        }
+
+        pageToken = res.data.nextPageToken || undefined;
+      } while (pageToken);
+
+      if (files.length > 0) {
+        return files;
+      }
+    } catch (apiErr) {
+      console.warn(`Drive API listFilesInFolder failed for ${folderId}, trying public web scraper:`, apiErr);
+    }
   }
 
-  const files: DriveItemMetadata[] = [];
-  let pageToken: string | undefined = undefined;
-
-  do {
-    const res: any = await drive.files.list({
-      q: `'${folderId}' in parents and trashed = false and (mimeType = 'application/pdf' or mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or name contains '.pdf' or name contains '.docx')`,
-      fields: "nextPageToken, files(id, name, mimeType, modifiedTime, size)",
-      pageSize: 100,
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-      pageToken,
+  // 2. Public Folder Web Scraper Fallback (for folders shared as "Anyone with the link")
+  try {
+    const folderRes = await fetch(`https://drive.google.com/drive/folders/${folderId}`, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
     });
 
-    if (res.data.files) {
-      for (const f of res.data.files) {
-        if (f.id && f.name) {
-          files.push({
-            id: f.id,
-            name: f.name,
-            mimeType: f.mimeType || "application/octet-stream",
-            modifiedTime: f.modifiedTime || new Date().toISOString(),
-            size: f.size || undefined,
+    if (folderRes.ok) {
+      const html = await folderRes.text();
+      const filesMap = new Map<string, DriveItemMetadata>();
+
+      // A. Extract items from _DRIVE_ivd or embedded JSON arrays
+      // Matches pattern: ["ID", ["filename.pdf", ...]] or [[ "ID", "name" ]]
+      const fileIdRegex = /"([a-zA-Z0-9_-]{25,45})"\s*,\s*\[\s*"([^"]+\.(?:pdf|docx|doc))"/gi;
+      let match;
+      while ((match = fileIdRegex.exec(html)) !== null) {
+        const id = match[1];
+        const name = match[2];
+        if (id && name && !filesMap.has(id)) {
+          filesMap.set(id, {
+            id,
+            name,
+            mimeType: name.endsWith(".docx")
+              ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              : "application/pdf",
+            modifiedTime: new Date().toISOString(),
           });
         }
       }
+
+      // B. Alternative pattern: "name.pdf" nearby an ID
+      const itemPattern = /\[\s*"([a-zA-Z0-9_-]{28,45})"\s*,\s*"([^"]+\.(?:pdf|docx|doc))"/gi;
+      while ((match = itemPattern.exec(html)) !== null) {
+        const id = match[1];
+        const name = match[2];
+        if (id && name && !filesMap.has(id)) {
+          filesMap.set(id, {
+            id,
+            name,
+            mimeType: name.endsWith(".docx")
+              ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              : "application/pdf",
+            modifiedTime: new Date().toISOString(),
+          });
+        }
+      }
+
+      // C. General pattern for PDF/DOCX names in data blobs
+      const docNameRegex = /"([^"]{2,100}\.(?:pdf|docx|doc))"/gi;
+      const allDocNames: string[] = [];
+      while ((match = docNameRegex.exec(html)) !== null) {
+        allDocNames.push(match[1]);
+      }
+
+      // If files were extracted via regex
+      if (filesMap.size > 0) {
+        return Array.from(filesMap.values());
+      }
     }
+  } catch (scrapeErr) {
+    console.warn("Public folder scraping error:", scrapeErr);
+  }
 
-    pageToken = res.data.nextPageToken || undefined;
-  } while (pageToken);
+  throw new Error(
+    "Could not read items from this Google Drive folder. Please ensure the folder is shared with 'Anyone with the link' (Viewer), or send the direct public file links (e.g. https://drive.google.com/file/d/.../view) into the chat."
+  );
+}
 
-  return files;
+export function extractAllDriveUrls(text: string): ParsedDriveUrl[] {
+  if (!text || typeof text !== "string") return [];
+
+  const results: ParsedDriveUrl[] = [];
+  const seen = new Set<string>();
+
+  // 1. Folders
+  const folderRegex = /(?:drive\.google\.com\/(?:drive\/(?:u\/\d+\/)?folders\/|folderview\?id=))([a-zA-Z0-9_-]{10,})/gi;
+  let fMatch;
+  while ((fMatch = folderRegex.exec(text)) !== null) {
+    const id = fMatch[1];
+    if (!seen.has(id)) {
+      seen.add(id);
+      results.push({ type: "folder", id });
+    }
+  }
+
+  // 2. Files
+  const fileRegex = /(?:drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?id=)|docs\.google\.com\/(?:document|spreadsheets|presentation|file)\/d\/)([a-zA-Z0-9_-]{10,})/gi;
+  let fileMatch;
+  while ((fileMatch = fileRegex.exec(text)) !== null) {
+    const id = fileMatch[1];
+    if (!seen.has(id)) {
+      seen.add(id);
+      results.push({ type: "file", id });
+    }
+  }
+
+  return results;
 }
 
 export function classifyDocumentType(
@@ -348,3 +472,4 @@ export function classifyDocumentType(
 
   return "RESUME";
 }
+
