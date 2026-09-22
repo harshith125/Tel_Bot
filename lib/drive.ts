@@ -16,45 +16,31 @@ export interface DriveItemMetadata {
 let _driveClient: drive_v3.Drive | null = null;
 
 export function parseDriveUrl(text: string): ParsedDriveUrl | null {
-  const trimmed = text.trim();
+  if (!text || typeof text !== "string") return null;
 
-  // Match Google Drive folder URLs
-  // Examples:
-  // https://drive.google.com/drive/folders/1aBcDeFgHiJkLmNoPqRsTuVwXyZ
-  // https://drive.google.com/drive/u/0/folders/1aBcDeFgHiJkLmNoPqRsTuVwXyZ
-  // https://drive.google.com/open?id=1aBcDeFgHiJkLmNoPqRsTuVwXyZ
-  const folderMatch = trimmed.match(
-    /(?:drive\.google\.com\/(?:drive\/(?:u\/\d+\/)?folders\/|open\?id=))([a-zA-Z0-9_-]{15,})/
+  // 1. Check for folder links anywhere in the string
+  // e.g. drive.google.com/drive/folders/ID or drive.google.com/drive/u/0/folders/ID or drive.google.com/folderview?id=ID
+  const folderMatch = text.match(
+    /(?:drive\.google\.com\/(?:drive\/(?:u\/\d+\/)?folders\/|folderview\?id=))([a-zA-Z0-9_-]{10,})/i
   );
 
-  if (folderMatch && trimmed.includes("folder")) {
+  if (folderMatch) {
     return {
       type: "folder",
       id: folderMatch[1],
     };
   }
 
-  // Match Google Drive file URLs
-  // Examples:
-  // https://drive.google.com/file/d/1aBcDeFgHiJkLmNoPqRsTuVwXyZ/view
-  // https://drive.google.com/file/d/1aBcDeFgHiJkLmNoPqRsTuVwXyZ
-  // https://docs.google.com/file/d/1aBcDeFgHiJkLmNoPqRsTuVwXyZ
-  const fileMatch = trimmed.match(
-    /(?:drive\.google\.com\/(?:file\/d\/|uc\?id=)|docs\.google\.com\/file\/d\/)([a-zA-Z0-9_-]{15,})/
+  // 2. Check for file links anywhere in the string
+  // e.g. drive.google.com/file/d/ID/view, docs.google.com/document/d/ID, drive.google.com/open?id=ID, drive.google.com/uc?id=ID
+  const fileMatch = text.match(
+    /(?:drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?id=)|docs\.google\.com\/(?:document|spreadsheets|presentation|file)\/d\/)([a-zA-Z0-9_-]{10,})/i
   );
 
   if (fileMatch) {
     return {
       type: "file",
       id: fileMatch[1],
-    };
-  }
-
-  // Generic fallback if folder URL without the word "folder"
-  if (folderMatch) {
-    return {
-      type: "folder",
-      id: folderMatch[1],
     };
   }
 
@@ -72,7 +58,6 @@ function getGoogleAuth() {
       if (serviceAccountKey.startsWith("{")) {
         keyData = JSON.parse(serviceAccountKey);
       } else {
-        // Assume base64 encoded
         const decoded = Buffer.from(serviceAccountKey, "base64").toString("utf-8");
         keyData = JSON.parse(decoded);
       }
@@ -88,7 +73,6 @@ function getGoogleAuth() {
   }
 
   if (clientEmail && privateKey) {
-    // Replace escaped newlines if passed in .env
     privateKey = privateKey.replace(/\\n/g, "\n");
     return new google.auth.JWT({
       email: clientEmail,
@@ -105,14 +89,20 @@ function getGoogleAuth() {
   return null;
 }
 
-export function getDriveClient(): drive_v3.Drive {
+export function hasGoogleCredentials(): boolean {
+  return Boolean(
+    process.env.GOOGLE_SERVICE_ACCOUNT_KEY ||
+      (process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL && process.env.GOOGLE_PRIVATE_KEY) ||
+      process.env.GOOGLE_DRIVE_API_KEY
+  );
+}
+
+export function getDriveClient(): drive_v3.Drive | null {
   if (_driveClient) return _driveClient;
 
   const auth = getGoogleAuth();
   if (!auth) {
-    throw new Error(
-      "Google Drive authentication missing. Please set GOOGLE_SERVICE_ACCOUNT_KEY (or GOOGLE_SERVICE_ACCOUNT_EMAIL and GOOGLE_PRIVATE_KEY) in environment variables."
-    );
+    return null;
   }
 
   if (typeof auth === "string") {
@@ -124,44 +114,172 @@ export function getDriveClient(): drive_v3.Drive {
   return _driveClient;
 }
 
-export async function getDriveFileMetadata(fileId: string): Promise<DriveItemMetadata> {
-  const drive = getDriveClient();
-  const res = await drive.files.get({
-    fileId,
-    fields: "id, name, mimeType, modifiedTime, size, trashed",
-    supportsAllDrives: true,
-  });
+/**
+ * Public direct downloader fallback when service account is not yet configured.
+ * Works for any Google Drive file or Google Doc shared with "Anyone with the link".
+ */
+export async function downloadPublicDriveFile(
+  fileId: string
+): Promise<{ buffer: Buffer; filename?: string }> {
+  const downloadUrls = [
+    `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`,
+    `https://docs.google.com/document/d/${fileId}/export?format=pdf`,
+    `https://docs.google.com/document/d/${fileId}/export?format=docx`,
+  ];
 
-  const file = res.data;
-  if (!file || file.trashed) {
-    throw new Error(`Google Drive file ${fileId} was not found or is in trash.`);
+  for (const url of downloadUrls) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        },
+        redirect: "follow",
+      });
+
+      if (res.ok) {
+        const contentType = res.headers.get("content-type") || "";
+
+        // If Google presents an HTML confirmation page for large files, parse confirm token
+        if (contentType.includes("text/html")) {
+          const html = await res.text();
+          const confirmMatch = html.match(/confirm=([0-9A-Za-z_-]+)/);
+          if (confirmMatch) {
+            const confirmRes = await fetch(
+              `https://drive.google.com/uc?export=download&id=${fileId}&confirm=${confirmMatch[1]}`,
+              { redirect: "follow" }
+            );
+            if (confirmRes.ok) {
+              const arrayBuf = await confirmRes.arrayBuffer();
+              const buf = Buffer.from(arrayBuf);
+              if (buf.length > 100) {
+                return { buffer: buf };
+              }
+            }
+          }
+          continue;
+        }
+
+        const arrayBuf = await res.arrayBuffer();
+        const buf = Buffer.from(arrayBuf);
+        if (buf.length > 50) {
+          const disp = res.headers.get("content-disposition");
+          let filename: string | undefined;
+          if (disp) {
+            const match = disp.match(/filename\*?=['"]?(?:UTF-8'')?([^'";\n]+)['"]?/i);
+            if (match) filename = decodeURIComponent(match[1]);
+          }
+          return { buffer: buf, filename };
+        }
+      }
+    } catch {
+      // try next URL
+    }
   }
 
+  throw new Error(
+    "Could not download file. Please ensure the Google Drive file is shared with 'Anyone with the link' (Viewer), or configure GOOGLE_SERVICE_ACCOUNT_KEY in environment variables."
+  );
+}
+
+export async function getDriveFileMetadata(fileId: string): Promise<DriveItemMetadata> {
+  const drive = getDriveClient();
+
+  if (drive) {
+    try {
+      const res = await drive.files.get({
+        fileId,
+        fields: "id, name, mimeType, modifiedTime, size, trashed",
+        supportsAllDrives: true,
+      });
+
+      const file = res.data;
+      if (file && !file.trashed) {
+        return {
+          id: file.id || fileId,
+          name: file.name || "Untitled_Document.pdf",
+          mimeType: file.mimeType || "application/pdf",
+          modifiedTime: file.modifiedTime || new Date().toISOString(),
+          size: file.size || undefined,
+        };
+      }
+    } catch (apiErr) {
+      console.warn(`Drive API files.get failed for ${fileId}, trying public fallback:`, apiErr);
+    }
+  }
+
+  // Fallback: Fetch public page title
+  try {
+    const pageRes = await fetch(`https://drive.google.com/file/d/${fileId}/view`, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+    });
+
+    if (pageRes.ok) {
+      const html = await pageRes.text();
+      const titleMatch =
+        html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i) ||
+        html.match(/<title>([^<]+)<\/title>/i);
+
+      if (titleMatch && titleMatch[1]) {
+        let name = titleMatch[1].replace(/ - Google (?:Drive|Docs)$/i, "").trim();
+        if (name && name.length > 0) {
+          return {
+            id: fileId,
+            name,
+            mimeType: name.endsWith(".docx")
+              ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              : "application/pdf",
+            modifiedTime: new Date().toISOString(),
+          };
+        }
+      }
+    }
+  } catch {}
+
   return {
-    id: file.id || fileId,
-    name: file.name || "Untitled",
-    mimeType: file.mimeType || "application/octet-stream",
-    modifiedTime: file.modifiedTime || new Date().toISOString(),
-    size: file.size || undefined,
+    id: fileId,
+    name: `Drive_Document_${fileId.slice(0, 8)}.pdf`,
+    mimeType: "application/pdf",
+    modifiedTime: new Date().toISOString(),
   };
 }
 
 export async function downloadDriveFile(fileId: string): Promise<Buffer> {
   const drive = getDriveClient();
-  const res = await drive.files.get(
-    {
-      fileId,
-      alt: "media",
-      supportsAllDrives: true,
-    },
-    { responseType: "arraybuffer" }
-  );
 
-  return Buffer.from(res.data as ArrayBuffer);
+  if (drive) {
+    try {
+      const res = await drive.files.get(
+        {
+          fileId,
+          alt: "media",
+          supportsAllDrives: true,
+        },
+        { responseType: "arraybuffer" }
+      );
+      return Buffer.from(res.data as ArrayBuffer);
+    } catch (apiErr) {
+      console.warn(`Drive API download failed for ${fileId}, trying public download fallback:`, apiErr);
+    }
+  }
+
+  // Public direct download fallback
+  const downloaded = await downloadPublicDriveFile(fileId);
+  return downloaded.buffer;
 }
 
 export async function listFilesInFolder(folderId: string): Promise<DriveItemMetadata[]> {
   const drive = getDriveClient();
+
+  if (!drive) {
+    throw new Error(
+      "To connect and monitor Google Drive folders, a Google Cloud Service Account is required. Please set GOOGLE_SERVICE_ACCOUNT_KEY in your environment variables and share the folder with the Service Account email."
+    );
+  }
+
   const files: DriveItemMetadata[] = [];
   let pageToken: string | undefined = undefined;
 
@@ -228,6 +346,5 @@ export function classifyDocumentType(
     return "RESUME";
   }
 
-  // Default to RESUME if ambiguous in auto mode
   return "RESUME";
 }
